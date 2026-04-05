@@ -283,8 +283,10 @@ namespace cAlgo.Robots
         public int MaxConcurrentTrades { get; set; }
         [Parameter("Max Trades Per Day",     DefaultValue = 4,     MinValue = 1,    MaxValue = 8,    Group = "Risk")]
         public int MaxTradesPerDay { get; set; }
-        [Parameter("Daily Loss Pause %",     DefaultValue = 1.5,   MinValue = 0,    MaxValue = 5.0,  Group = "Risk")]
+        [Parameter("Daily Loss Pause %",     DefaultValue = 1.0,   MinValue = 0,    MaxValue = 5.0,  Group = "Risk")]
         public double DailyLossPausePct { get; set; }
+        [Parameter("Max Consecutive Losses", DefaultValue = 2,    MinValue = 1,    MaxValue = 5,    Group = "Risk")]
+        public int MaxConsecutiveLosses { get; set; }
         [Parameter("FTMO Phase (1 or 2)",    DefaultValue = 1,     MinValue = 1,    MaxValue = 2,    Group = "Risk")]
         public int Phase { get; set; }
         [Parameter("Min Confidence %",       DefaultValue = 42.0,  MinValue = 25.0, MaxValue = 75.0, Group = "Signal")]
@@ -330,6 +332,7 @@ namespace cAlgo.Robots
         private List<TradeRecord>          _closed   = new List<TradeRecord>();
         private Dictionary<int, TradeRecord> _open   = new Dictionary<int, TradeRecord>();
         private Dictionary<string, int>    _cooldown = new Dictionary<string, int>();
+        private int                        _consecLosses = 0;
 
         private DateTime _lastDay       = DateTime.MinValue;
         private double   _dayPnL        = 0;
@@ -424,9 +427,10 @@ namespace cAlgo.Robots
             {
                 StoreDailyReturn();
                 _risk.OnNewDay(Account.Balance);
-                _dayPnL      = 0;
-                _tradedToday = false;
-                _dayTrades   = 0;
+                _dayPnL       = 0;
+                _tradedToday  = false;
+                _dayTrades    = 0;
+                _consecLosses = 0;
                 _lastDay     = today;
                 _obvVal      = 0;
                 _adVal       = 0;
@@ -491,6 +495,9 @@ namespace cAlgo.Robots
             if (_cooldown.ContainsKey(SymbolName) && _cooldown[SymbolName] > 0)
             { _cooldown[SymbolName]--; return; }
 
+            // ── Consecutive loss gate ────────────────────────────
+            if (_consecLosses >= MaxConsecutiveLosses) return;
+
             // ── Calculate all signals ────────────────────────────
             var sigs = CalculateAllIndicators(idx);
             var signal = AggregateSignal(sigs, idx);
@@ -514,6 +521,20 @@ namespace cAlgo.Robots
                         if (signal.Direction == SignalDirection.Long  && h4Bear) return;
                         if (signal.Direction == SignalDirection.Short && h4Bull) return;
                     }
+                }
+            }
+
+            // H1 real-time price confirmation — prevents buying into H1 downswings
+            // even when H4 EMA trend is still bullish (H4 is too slow/lagging)
+            int h1Idx = _h1Bars.Count - 2;
+            if (h1Idx >= 50)
+            {
+                double h1Close = _h1Bars.ClosePrices[h1Idx];
+                double h1Ema50 = _h1Ema50.Result[h1Idx];
+                if (!double.IsNaN(h1Ema50))
+                {
+                    if (signal.Direction == SignalDirection.Long  && h1Close < h1Ema50) return;
+                    if (signal.Direction == SignalDirection.Short && h1Close > h1Ema50) return;
                 }
             }
 
@@ -555,7 +576,16 @@ namespace cAlgo.Robots
                 _open.Remove(pos.Id);
             }
 
-            if (pnl < 0) _cooldown[SymbolName] = 5;
+            if (pnl < 0)
+            {
+                _consecLosses++;
+                // Longer cooldown after each loss: 5, 10, 20 bars
+                _cooldown[SymbolName] = Math.Min(5 * _consecLosses, 20);
+            }
+            else
+            {
+                _consecLosses = 0;
+            }
             Print(string.Format("[MARS v2][CLOSED] {0} PnL={1:F2} DayPnL={2:F2}", pos.Label, pnl, _dayPnL));
         }
         #endregion
