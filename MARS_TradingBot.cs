@@ -613,20 +613,31 @@ namespace cAlgo.Robots
                 else                         s.Set("BB_STATE",  0.0);
             }
 
-            // ── 5. CANDLE: directional confirmation ───────────────────
-            // +1 = bullish candle pattern, -1 = bearish candle pattern
+            // ── 5. CANDLE: named pattern only — no generic green/red candles ──
+            // Requires a real reversal signal, not just any bullish/bearish bar
             if (idx >= 2)
             {
-                bool bullCandle = IsBullishEngulfing(idx) || IsHammer(idx) || IsBullishPinBar(idx)
-                    || (Bars.ClosePrices[idx] > Bars.OpenPrices[idx]
-                        && Bars.ClosePrices[idx] > Bars.ClosePrices[idx - 1]);
-                bool bearCandle = IsBearishEngulfing(idx) || IsShootingStar(idx) || IsBearishPinBar(idx)
-                    || (Bars.ClosePrices[idx] < Bars.OpenPrices[idx]
-                        && Bars.ClosePrices[idx] < Bars.ClosePrices[idx - 1]);
+                bool bullCandle = IsBullishEngulfing(idx) || IsHammer(idx) || IsBullishPinBar(idx);
+                bool bearCandle = IsBearishEngulfing(idx) || IsShootingStar(idx) || IsBearishPinBar(idx);
                 if      (bullCandle && !bearCandle) s.Set("CANDLE",  1.0);
                 else if (bearCandle && !bullCandle) s.Set("CANDLE", -1.0);
                 else                               s.Set("CANDLE",  0.0);
             }
+
+            // ── 6. ADX: only trade in trending markets (ADX > 20) ─────────
+            // Eliminates entries in choppy/ranging conditions
+            double adx = _dms.ADX[idx];
+            double diP = _dms.DIPlus[idx];
+            double diM = _dms.DIMinus[idx];
+            if (!double.IsNaN(adx) && adx > 20.0 && !double.IsNaN(diP) && !double.IsNaN(diM))
+            {
+                s.Set("ADX_TREND", diP > diM ? 1.0 : -1.0);
+            }
+
+            // ── 7. SESSION: London or NY only ─────────────────────────────
+            double h = Server.Time.Hour + Server.Time.Minute / 60.0;
+            bool inSession = (h >= 7.0 && h <= 11.75) || (h >= 13.0 && h <= 17.0);
+            s.Set("SESSION", inSession ? 1.0 : -1.0);
 
             return s;
         }
@@ -642,10 +653,11 @@ namespace cAlgo.Robots
                 ActiveSignals = sigs, Direction = SignalDirection.None
             };
 
-            // All 5 conditions must be present and agree — AND gate, not average
-            if (!sigs.ContainsKey("H4_TREND") || !sigs.ContainsKey("H1_TREND")  ||
-                !sigs.ContainsKey("RSI_STATE") || !sigs.ContainsKey("BB_STATE")  ||
-                !sigs.ContainsKey("CANDLE"))
+            // All 7 conditions must be present and agree — AND gate, not average
+            if (!sigs.ContainsKey("H4_TREND") || !sigs.ContainsKey("H1_TREND") ||
+                !sigs.ContainsKey("RSI_STATE") || !sigs.ContainsKey("BB_STATE") ||
+                !sigs.ContainsKey("CANDLE")    || !sigs.ContainsKey("ADX_TREND")||
+                !sigs.ContainsKey("SESSION"))
                 return result;
 
             double h4  = sigs["H4_TREND"];
@@ -653,11 +665,15 @@ namespace cAlgo.Robots
             double rsi = sigs["RSI_STATE"];
             double bb  = sigs["BB_STATE"];
             double ca  = sigs["CANDLE"];
+            double adx = sigs["ADX_TREND"];
+            double ses = sigs["SESSION"];
+
+            if (ses < 0) return result; // never trade outside London/NY
 
             // BUY: every condition must be positive
-            bool buySetup  = h4 > 0 && h1 > 0 && rsi > 0 && bb > 0 && ca > 0;
+            bool buySetup  = h4 > 0 && h1 > 0 && rsi > 0 && bb > 0 && ca > 0 && adx > 0;
             // SELL: every condition must be negative
-            bool sellSetup = h4 < 0 && h1 < 0 && rsi < 0 && bb < 0 && ca < 0;
+            bool sellSetup = h4 < 0 && h1 < 0 && rsi < 0 && bb < 0 && ca < 0 && adx < 0;
 
             if (!buySetup && !sellSetup) return result;
 
@@ -680,8 +696,8 @@ namespace cAlgo.Robots
             result.Tp3Distance  = slDist * 3.0;
             result.RiskReward   = 3.0;
             result.TimeHorizon  = "2-8h";
-            result.Rationale    = string.Format("H4={0:F0} H1={1:F0} RSI={2:F0} BB={3:F0} CA={4:F0}",
-                                  h4, h1, rsi, bb, ca);
+            result.Rationale    = string.Format("H4={0:F0} H1={1:F0} RSI={2:F0} BB={3:F0} CA={4:F0} ADX={5:F0}",
+                                  h4, h1, rsi, bb, ca, adx);
             result.EntryPrice   = dir == SignalDirection.Long ? Symbol.Ask : Symbol.Bid;
 
             return result;
