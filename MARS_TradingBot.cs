@@ -364,6 +364,12 @@ namespace cAlgo.Robots
         // Bar counter for weight logging
         private int _barCount = 0;
 
+        // Adaptive threshold — self-adjusts based on recent performance
+        private double         _entryThreshold  = 55.0; // 0-100 score needed to enter
+        private Queue<bool>    _last20Outcomes  = new Queue<bool>();
+        private int            _totalWins       = 0;
+        private int            _totalLosses     = 0;
+
         // News dates
         private HashSet<DateTime> _fomcSet = new HashSet<DateTime>();
         private HashSet<DateTime> _ecbSet  = new HashSet<DateTime>();
@@ -502,13 +508,14 @@ namespace cAlgo.Robots
             // ── Consecutive loss gate ────────────────────────────
             if (_consecLosses >= MaxConsecutiveLosses) return;
 
-            // ── Calculate all signals ────────────────────────────
-            var sigs = CalculateAllIndicators(idx);
+            // ── AI-scored multi-layer evaluation ─────────────────
+            var sigs   = new IndicatorSignals(); // kept for AI weight recording
             var signal = AggregateSignal(sigs, idx);
 
             if (signal.Direction == SignalDirection.None) return;
 
-            // All 5 conditions already verified inside AggregateSignal — enter directly
+            Print(string.Format("[MARS][SIGNAL] {0} Score={1:F0}/100 Thr={2:F1} | {3}",
+                signal.Direction, Math.Abs(signal.Score * 100), _entryThreshold, signal.Rationale));
             OpenTrade(signal, idx);
         }
 
@@ -547,69 +554,161 @@ namespace cAlgo.Robots
                 _open.Remove(pos.Id);
             }
 
-            if (pnl < 0)
+            bool won = pnl > 0;
+            UpdateAdaptiveThreshold(won);
+
+            if (!won)
             {
                 _consecLosses++;
-                // Longer cooldown after each loss: 5, 10, 20 bars
                 _cooldown[SymbolName] = Math.Min(5 * _consecLosses, 20);
             }
             else
             {
                 _consecLosses = 0;
             }
-            Print(string.Format("[MARS v2][CLOSED] {0} PnL={1:F2} DayPnL={2:F2}", pos.Label, pnl, _dayPnL));
+            Print(string.Format("[MARS v2][CLOSED] {0} PnL={1:F2} DayPnL={2:F2} Threshold={3:F1}",
+                pos.Label, pnl, _dayPnL, _entryThreshold));
         }
         #endregion
 
-        #region Signal Calculations — 5-Condition High-Quality System
-        private IndicatorSignals CalculateAllIndicators(int idx)
-        {
-            var s = new IndicatorSignals();
-            double atr   = _atr.Result[idx];
-            double close = Bars.ClosePrices[idx];
-            if (atr <= 0 || double.IsNaN(atr)) return s;
+        #region Signal Calculations — AI Scored Multi-Layer System
 
-            // ── 1. H4 TREND: EMA50 vs EMA200 ─────────────────────────
+        // ─────────────────────────────────────────────────────────────────
+        // EvaluateSetup: scores a potential trade 0-100 across 3 layers.
+        // Returns score>0 = bullish, score<0 = bearish, 0 = no trade.
+        // Each layer is independent — partial alignment still scores.
+        // ─────────────────────────────────────────────────────────────────
+        private double EvaluateSetup(int idx, out string reasoning)
+        {
+            reasoning = "";
+            double atr = _atr.Result[idx];
+            if (atr <= 0 || double.IsNaN(atr)) return 0;
+
+            double close = Bars.ClosePrices[idx];
+            double buyPts = 0, sellPts = 0;
+            var r = new System.Text.StringBuilder();
+
+            // ═══════════════════════════════════════════════════
+            // LAYER 1 — MACRO CONTEXT (H4)    max ±30 points
+            // Answers: "What is the big-picture direction?"
+            // ═══════════════════════════════════════════════════
             int h4Idx = _h4Bars.Count - 2;
             if (h4Idx >= 0)
             {
                 double h4e50  = _h4Ema50.Result[h4Idx];
                 double h4e200 = _h4Ema200.Result[h4Idx];
-                if (!double.IsNaN(h4e50) && !double.IsNaN(h4e200))
-                    s.Set("H4_TREND", h4e50 > h4e200 ? 1.0 : -1.0);
+                if (!double.IsNaN(h4e50) && !double.IsNaN(h4e200) && h4e200 > 0)
+                {
+                    // H4 EMA alignment — core macro bias
+                    if (h4e50 > h4e200) { buyPts  += 15; r.Append("H4:Bull+15 "); }
+                    else                { sellPts += 15; r.Append("H4:Bear+15 "); }
+
+                    // Trend strength: separation > 0.08% = trending, not flat
+                    double sep = Math.Abs(h4e50 - h4e200) / h4e200 * 100.0;
+                    if (sep > 0.08)
+                    {
+                        if (h4e50 > h4e200) { buyPts  += 10; r.Append("H4:Strong+10 "); }
+                        else                { sellPts += 10; r.Append("H4:Strong+10 "); }
+                    }
+
+                    // Price side relative to H4 EMA200 (macro mean)
+                    double h4Close = _h4Bars.ClosePrices[h4Idx];
+                    if (h4Close > h4e200) { buyPts  += 5; r.Append("H4:AboveMean+5 "); }
+                    else                  { sellPts += 5; r.Append("H4:BelowMean+5 "); }
+                }
             }
 
-            // ── 2. H1 TREND: close vs H1 EMA50 ────────────────────────
+            // ═══════════════════════════════════════════════════
+            // LAYER 2 — MOMENTUM CONFIRMATION (H1)  max ±35 pts
+            // Answers: "Is the trend actually moving right now?"
+            // ═══════════════════════════════════════════════════
             int h1Idx = _h1Bars.Count - 2;
-            if (h1Idx >= 50)
+            if (h1Idx >= 26)
             {
                 double h1Close = _h1Bars.ClosePrices[h1Idx];
                 double h1e50   = _h1Ema50.Result[h1Idx];
+                double h1e200  = _h1Ema200.Result[h1Idx];
+                double h1e12   = _h1Ema12.Result[h1Idx];
+                double h1e26   = _h1Ema26.Result[h1Idx];
+
+                // H1 price vs EMA50 — medium-term momentum
                 if (!double.IsNaN(h1e50))
-                    s.Set("H1_TREND", h1Close > h1e50 ? 1.0 : -1.0);
+                {
+                    if (h1Close > h1e50) { buyPts  += 15; r.Append("H1:Above50+15 "); }
+                    else                 { sellPts += 15; r.Append("H1:Below50+15 "); }
+                }
+
+                // H1 MACD (EMA12 vs EMA26) — momentum direction
+                if (!double.IsNaN(h1e12) && !double.IsNaN(h1e26))
+                {
+                    if (h1e12 > h1e26) { buyPts  += 10; r.Append("H1:MACD++10 "); }
+                    else               { sellPts += 10; r.Append("H1:MACD-+10 "); }
+                }
+
+                // H1 price vs EMA200 — confirms we are in a real trend, not noise
+                if (!double.IsNaN(h1e200))
+                {
+                    if (h1Close > h1e200) { buyPts  += 10; r.Append("H1:Above200+10 "); }
+                    else                  { sellPts += 10; r.Append("H1:Below200+10 "); }
+                }
             }
 
-            // ── 3. M15 RSI: pullback in trend ─────────────────────────
-            // Wide thresholds: RSI < RsiBuyThreshold = pullback in uptrend
-            double rsi = CalcRSI(idx, 14);
-            if (!double.IsNaN(rsi))
-            {
-                if      (rsi < RsiBuyThreshold)  s.Set("RSI_STATE",  1.0);
-                else if (rsi > RsiSellThreshold) s.Set("RSI_STATE", -1.0);
-                else                             s.Set("RSI_STATE",  0.0);
-            }
+            // ═══════════════════════════════════════════════════
+            // LAYER 3 — ENTRY TIMING (M15)    max ±35 points
+            // Answers: "Is this a good moment to enter?"
+            // ═══════════════════════════════════════════════════
 
-            // ── 4. ADX: trending market filter ────────────────────────
-            // Only trade when market has directional momentum
+            // ADX trend strength + direction
             double adx = _dms.ADX[idx];
             double diP = _dms.DIPlus[idx];
             double diM = _dms.DIMinus[idx];
             if (!double.IsNaN(adx) && !double.IsNaN(diP) && !double.IsNaN(diM) && adx > 18.0)
-                s.Set("ADX_TREND", diP > diM ? 1.0 : -1.0);
+            {
+                if (diP > diM) { buyPts  += 15; r.Append("ADX:Bull+15 "); }
+                else           { sellPts += 15; r.Append("ADX:Bear+15 "); }
+            }
 
-            return s;
+            // RSI pullback — entering when price has pulled back, not extended
+            double rsi = CalcRSI(idx, 14);
+            if (!double.IsNaN(rsi))
+            {
+                if      (rsi < RsiBuyThreshold)  { buyPts  += 10; r.Append("RSI:Cheap+10 "); }
+                else if (rsi > RsiSellThreshold) { sellPts += 10; r.Append("RSI:Rich+10 "); }
+                // Partial credit: RSI between threshold and 50 = slight pullback
+                else if (rsi < 50) { buyPts  += 3; r.Append("RSI:Mild+3 "); }
+                else               { sellPts += 3; r.Append("RSI:Mild+3 "); }
+            }
+
+            // Price proximity to EMA21 — confirms we are buying a pullback, not a breakout
+            double ema21 = _ema21.Result[idx];
+            if (!double.IsNaN(ema21) && atr > 0)
+            {
+                double dist = Math.Abs(close - ema21) / atr;
+                if (dist < 1.5)
+                {
+                    if (close > ema21) { buyPts  += 5; r.Append("M15:NearEMA+5 "); }
+                    else               { sellPts += 5; r.Append("M15:NearEMA+5 "); }
+                }
+            }
+
+            // Volume: above-average volume = conviction
+            double vol    = Bars.TickVolumes[idx];
+            double volSma = _volSma20.Result[idx];
+            if (!double.IsNaN(volSma) && volSma > 0 && vol > volSma * 1.1)
+            {
+                bool bullBar = close > Bars.OpenPrices[idx];
+                if (bullBar) { buyPts  += 5; r.Append("Vol:Bull+5 "); }
+                else         { sellPts += 5; r.Append("Vol:Bear+5 "); }
+            }
+
+            reasoning = r.ToString().TrimEnd();
+
+            // Net score: positive = bullish edge, negative = bearish edge
+            double netScore = buyPts - sellPts;  // range roughly -100 to +100
+            return netScore;
         }
         #endregion
+
 
 
         #region Signal Aggregation & Trade Decision
@@ -621,33 +720,27 @@ namespace cAlgo.Robots
                 ActiveSignals = sigs, Direction = SignalDirection.None
             };
 
-            // All 4 conditions must agree — AND gate
-            if (!sigs.ContainsKey("H4_TREND") || !sigs.ContainsKey("H1_TREND") ||
-                !sigs.ContainsKey("RSI_STATE") || !sigs.ContainsKey("ADX_TREND"))
-                return result;
+            // Run the scored multi-layer analysis
+            string reasoning;
+            double netScore = EvaluateSetup(idx, out reasoning);
 
-            double h4  = sigs["H4_TREND"];
-            double h1  = sigs["H1_TREND"];
-            double rsi = sigs["RSI_STATE"];
-            double adx = sigs["ADX_TREND"];
+            // Minimum score gate — adaptive threshold self-adjusts after each trade
+            if (Math.Abs(netScore) < _entryThreshold) return result;
 
-            // BUY: H4 up, H1 up, RSI pulled back, ADX confirms upward momentum
-            bool buySetup  = h4 > 0 && h1 > 0 && rsi > 0 && adx > 0;
-            // SELL: H4 down, H1 down, RSI rallied, ADX confirms downward momentum
-            bool sellSetup = h4 < 0 && h1 < 0 && rsi < 0 && adx < 0;
+            SignalDirection dir = netScore > 0 ? SignalDirection.Long : SignalDirection.Short;
 
-            if (!buySetup && !sellSetup) return result;
+            // Normalise score to [-1, +1] for compatibility with rest of system
+            double normScore = Math.Max(-1.0, Math.Min(1.0, netScore / 100.0));
+            double confidence = Math.Min(100.0, Math.Abs(netScore));
 
-            SignalDirection dir = buySetup ? SignalDirection.Long : SignalDirection.Short;
             result.Direction      = dir;
-            result.Score          = buySetup ? 1.0 : -1.0;
-            result.Confidence     = 100.0; // all 5 agreed
-            result.ConfluenceCount = 5;
-            result.StrengthLabel  = buySetup ? "BUY" : "SELL";
-
-            // Also run AI scoring for learning — weight update still improves over time
-            double aiScore = _ai.Score(sigs);
-            result.Score = aiScore != 0 ? aiScore : result.Score;
+            result.Score          = normScore;
+            result.Confidence     = confidence;
+            result.ConfluenceCount = (int)(Math.Abs(netScore) / 10);
+            result.StrengthLabel  = netScore > 80 ? "STRONG " + dir.ToString().ToUpper()
+                                  : netScore > 55 ? dir.ToString().ToUpper()
+                                  : "WEAK " + dir.ToString().ToUpper();
+            result.ActiveSignals  = sigs;
 
             double atr    = _atr.Result[idx];
             double slDist = ComputeSlDistance(dir, idx, atr);
@@ -657,11 +750,36 @@ namespace cAlgo.Robots
             result.Tp3Distance  = slDist * 3.0;
             result.RiskReward   = 3.0;
             result.TimeHorizon  = "2-8h";
-            result.Rationale    = string.Format("H4={0:F0} H1={1:F0} RSI={2:F1} ADX={3:F0}",
-                                  h4, h1, rsi, adx);
+            result.Rationale    = string.Format("[Score={0:F0}/100 Thr={1:F0}] {2}",
+                                  Math.Abs(netScore), _entryThreshold, reasoning);
             result.EntryPrice   = dir == SignalDirection.Long ? Symbol.Ask : Symbol.Bid;
 
             return result;
+        }
+
+        // Called after every closed trade — self-adjusts entry threshold
+        private void UpdateAdaptiveThreshold(bool win)
+        {
+            _last20Outcomes.Enqueue(win);
+            if (_last20Outcomes.Count > 20) _last20Outcomes.Dequeue();
+            if (win) _totalWins++; else _totalLosses++;
+
+            if (_last20Outcomes.Count < 10) return; // need min 10 trades to adapt
+
+            int wins = 0;
+            foreach (bool b in _last20Outcomes) if (b) wins++;
+            double recentWR = (double)wins / _last20Outcomes.Count;
+
+            // Losing streak: raise the bar (harder to enter)
+            if (recentWR < 0.38) _entryThreshold = Math.Min(70.0, _entryThreshold + 2.0);
+            // Winning streak: can afford slightly looser entries for more trades
+            else if (recentWR > 0.62) _entryThreshold = Math.Max(45.0, _entryThreshold - 1.0);
+            // Neutral: drift back toward 55
+            else _entryThreshold += (_entryThreshold > 55.0 ? -0.5 : 0.5);
+
+            Print(string.Format("[MARS][AI] Threshold={0:F1} RecentWR={1:F1}% (W{2}/L{3} last {4})",
+                _entryThreshold, recentWR * 100, wins, _last20Outcomes.Count - wins,
+                _last20Outcomes.Count));
         }
 
         private double ComputeSlDistance(SignalDirection dir, int idx, double atr)
