@@ -289,21 +289,34 @@ namespace cAlgo.Robots
         public int MaxConsecutiveLosses { get; set; }
         [Parameter("FTMO Phase (1 or 2)",    DefaultValue = 1,     MinValue = 1,    MaxValue = 2,    Group = "Risk")]
         public int Phase { get; set; }
-        [Parameter("RSI Buy Threshold",      DefaultValue = 40,    MinValue = 25,   MaxValue = 50,   Group = "Signal")]
-        public int RsiBuyThreshold { get; set; }
-        [Parameter("RSI Sell Threshold",     DefaultValue = 60,    MinValue = 50,   MaxValue = 75,   Group = "Signal")]
-        public int RsiSellThreshold { get; set; }
-        [Parameter("BB Buy Zone (0-1)",      DefaultValue = 0.25,  MinValue = 0.1,  MaxValue = 0.45, Group = "Signal")]
-        public double BbBuyZone { get; set; }
-        [Parameter("BB Sell Zone (0-1)",     DefaultValue = 0.75,  MinValue = 0.55, MaxValue = 0.9,  Group = "Signal")]
-        public double BbSellZone { get; set; }
-        [Parameter("Enable AI Learning",     DefaultValue = true,                                    Group = "Signal")]
+        // ── London Breakout Strategy Parameters ──────────────────
+        [Parameter("Asian Range Start Hour UTC", DefaultValue = 22, MinValue = 20, MaxValue = 23, Group = "Strategy")]
+        public int AsianStartHour { get; set; }
+        [Parameter("Asian Range End Hour UTC",   DefaultValue = 7,  MinValue = 5,  MaxValue = 9,  Group = "Strategy")]
+        public int AsianEndHour { get; set; }
+        [Parameter("London Window End Hour UTC", DefaultValue = 10, MinValue = 8,  MaxValue = 13, Group = "Strategy")]
+        public int LondonEndHour { get; set; }
+        [Parameter("Min Asian Range (pips)",     DefaultValue = 8,  MinValue = 4,  MaxValue = 20, Group = "Strategy")]
+        public int AsianRangeMinPips { get; set; }
+        [Parameter("Max Asian Range (pips)",     DefaultValue = 35, MinValue = 20, MaxValue = 60, Group = "Strategy")]
+        public int AsianRangeMaxPips { get; set; }
+        [Parameter("Breakout Confirm Pips",      DefaultValue = 3,  MinValue = 1,  MaxValue = 8,  Group = "Strategy")]
+        public int BreakoutConfirmPips { get; set; }
+        [Parameter("Volume Breakout Mult",       DefaultValue = 1.3,MinValue = 1.0,MaxValue = 2.5,Group = "Strategy")]
+        public double VolumeBreakoutMult { get; set; }
+        [Parameter("H4 Trend Filter",            DefaultValue = true,                              Group = "Strategy")]
+        public bool H4TrendFilter { get; set; }
+        [Parameter("RSI Max on BUY breakout",    DefaultValue = 65, MinValue = 55, MaxValue = 80, Group = "Strategy")]
+        public int RsiMaxBuy { get; set; }
+        [Parameter("RSI Min on SELL breakout",   DefaultValue = 35, MinValue = 20, MaxValue = 45, Group = "Strategy")]
+        public int RsiMinSell { get; set; }
+        [Parameter("Enable AI Learning",         DefaultValue = true,                              Group = "Strategy")]
         public bool EnableLearning { get; set; }
-        [Parameter("ATR Period",             DefaultValue = 14,    MinValue = 5,    MaxValue = 30,   Group = "Indicators")]
+        [Parameter("ATR Period",                 DefaultValue = 14, MinValue = 5,  MaxValue = 30, Group = "Indicators")]
         public int AtrPeriod { get; set; }
-        [Parameter("FOMC Dates (yyyy-MM-dd,csv)", DefaultValue = "",                                 Group = "News")]
+        [Parameter("FOMC Dates (yyyy-MM-dd,csv)", DefaultValue = "",                               Group = "News")]
         public string FomcDates { get; set; }
-        [Parameter("ECB Dates (yyyy-MM-dd,csv)",  DefaultValue = "",                                 Group = "News")]
+        [Parameter("ECB Dates (yyyy-MM-dd,csv)",  DefaultValue = "",                               Group = "News")]
         public string EcbDates { get; set; }
         #endregion
 
@@ -369,6 +382,13 @@ namespace cAlgo.Robots
         private Queue<bool>    _last20Outcomes  = new Queue<bool>();
         private int            _totalWins       = 0;
         private int            _totalLosses     = 0;
+
+        // Asian session range tracking (London Breakout strategy)
+        private double   _asianHigh            = 0;
+        private double   _asianLow             = double.MaxValue;
+        private bool     _asianRangeSet        = false;
+        private DateTime _asianRangeDate       = DateTime.MinValue;
+        private bool     _londonEntryDoneToday = false;
 
         // News dates
         private HashSet<DateTime> _fomcSet = new HashSet<DateTime>();
@@ -444,6 +464,11 @@ namespace cAlgo.Robots
                 _lastDay     = today;
                 _obvVal      = 0;
                 _adVal       = 0;
+                // Reset London breakout tracking
+                _londonEntryDoneToday = false;
+                _asianHigh    = 0;
+                _asianLow     = double.MaxValue;
+                _asianRangeSet = false;
                 Print("[MARS v2] New day: " + today.ToString("yyyy-MM-dd") +
                       " Bal=" + Account.Balance.ToString("F2"));
             }
@@ -571,141 +596,148 @@ namespace cAlgo.Robots
         }
         #endregion
 
-        #region Signal Calculations — AI Scored Multi-Layer System
+        #region Signal Calculations — London Session Breakout (EURUSD-Specific)
 
         // ─────────────────────────────────────────────────────────────────
-        // EvaluateSetup: scores a potential trade 0-100 across 3 layers.
-        // Returns score>0 = bullish, score<0 = bearish, 0 = no trade.
-        // Each layer is independent — partial alignment still scores.
+        // EvaluateLondonBreakout: EURUSD-specific London open breakout.
+        //
+        // Phase 1 (Asian session 22:00–07:00 UTC): accumulate range H/L.
+        // Phase 2 (London 07:00–LondonEndHour UTC): detect break of range.
+        //
+        // Returns score >0 = BUY breakout, <0 = SELL breakout, 0 = no trade.
+        // slDistance is set to the structural SL size (range + ATR buffer).
         // ─────────────────────────────────────────────────────────────────
-        private double EvaluateSetup(int idx, out string reasoning)
+        private double EvaluateLondonBreakout(int idx, out string reasoning, out double slDistance)
         {
-            reasoning = "";
-            double atr = _atr.Result[idx];
+            reasoning  = "";
+            slDistance = 0;
+
+            int hour = Server.Time.Hour;
+
+            // ── Phase 1: Build Asian range ─────────────────────────────
+            // Asian session wraps midnight: hour >= AsianStartHour OR hour < AsianEndHour
+            bool inAsian = (hour >= AsianStartHour || hour < AsianEndHour);
+            if (inAsian)
+            {
+                double h = Bars.HighPrices[idx];
+                double l = Bars.LowPrices[idx];
+                DateTime today = Server.Time.Date;
+                if (today != _asianRangeDate)
+                {
+                    // New calendar day: start fresh range
+                    _asianHigh      = h;
+                    _asianLow       = l;
+                    _asianRangeDate = today;
+                    _londonEntryDoneToday = false;
+                }
+                else
+                {
+                    if (h > _asianHigh) _asianHigh = h;
+                    if (l < _asianLow)  _asianLow  = l;
+                }
+                _asianRangeSet = true;
+                return 0; // no trade during Asian session
+            }
+
+            // ── Phase 2: London breakout window ───────────────────────
+            if (hour < AsianEndHour || hour >= LondonEndHour) return 0;
+            if (!_asianRangeSet)   { reasoning = "No Asian range yet"; return 0; }
+            if (_londonEntryDoneToday) return 0;
+
+            // ── Range quality filter ───────────────────────────────────
+            double rangePips = (_asianHigh - _asianLow) / Symbol.PipSize;
+            if (rangePips < AsianRangeMinPips)
+            { reasoning = "Range too small: " + rangePips.ToString("F1") + "p < " + AsianRangeMinPips; return 0; }
+            if (rangePips > AsianRangeMaxPips)
+            { reasoning = "Range too large: " + rangePips.ToString("F1") + "p > " + AsianRangeMaxPips; return 0; }
+
+            double close       = Bars.ClosePrices[idx];
+            double atr         = _atr.Result[idx];
             if (atr <= 0 || double.IsNaN(atr)) return 0;
+            double confirmDist = BreakoutConfirmPips * Symbol.PipSize;
 
-            double close = Bars.ClosePrices[idx];
-            double buyPts = 0, sellPts = 0;
-            var r = new System.Text.StringBuilder();
+            // ── Breakout direction detection ───────────────────────────
+            bool bullBreak = close > _asianHigh + confirmDist;
+            bool bearBreak = close < _asianLow  - confirmDist;
+            if (!bullBreak && !bearBreak) return 0;
 
-            // ═══════════════════════════════════════════════════
-            // LAYER 1 — MACRO CONTEXT (H4)    max ±30 points
-            // Answers: "What is the big-picture direction?"
-            // ═══════════════════════════════════════════════════
-            int h4Idx = _h4Bars.Count - 2;
-            if (h4Idx >= 0)
-            {
-                double h4e50  = _h4Ema50.Result[h4Idx];
-                double h4e200 = _h4Ema200.Result[h4Idx];
-                if (!double.IsNaN(h4e50) && !double.IsNaN(h4e200) && h4e200 > 0)
-                {
-                    // H4 EMA alignment — core macro bias
-                    if (h4e50 > h4e200) { buyPts  += 15; r.Append("H4:Bull+15 "); }
-                    else                { sellPts += 15; r.Append("H4:Bear+15 "); }
-
-                    // Trend strength: separation > 0.08% = trending, not flat
-                    double sep = Math.Abs(h4e50 - h4e200) / h4e200 * 100.0;
-                    if (sep > 0.08)
-                    {
-                        if (h4e50 > h4e200) { buyPts  += 10; r.Append("H4:Strong+10 "); }
-                        else                { sellPts += 10; r.Append("H4:Strong+10 "); }
-                    }
-
-                    // Price side relative to H4 EMA200 (macro mean)
-                    double h4Close = _h4Bars.ClosePrices[h4Idx];
-                    if (h4Close > h4e200) { buyPts  += 5; r.Append("H4:AboveMean+5 "); }
-                    else                  { sellPts += 5; r.Append("H4:BelowMean+5 "); }
-                }
-            }
-
-            // ═══════════════════════════════════════════════════
-            // LAYER 2 — MOMENTUM CONFIRMATION (H1)  max ±35 pts
-            // Answers: "Is the trend actually moving right now?"
-            // ═══════════════════════════════════════════════════
-            int h1Idx = _h1Bars.Count - 2;
-            if (h1Idx >= 26)
-            {
-                double h1Close = _h1Bars.ClosePrices[h1Idx];
-                double h1e50   = _h1Ema50.Result[h1Idx];
-                double h1e200  = _h1Ema200.Result[h1Idx];
-                double h1e12   = _h1Ema12.Result[h1Idx];
-                double h1e26   = _h1Ema26.Result[h1Idx];
-
-                // H1 price vs EMA50 — medium-term momentum
-                if (!double.IsNaN(h1e50))
-                {
-                    if (h1Close > h1e50) { buyPts  += 15; r.Append("H1:Above50+15 "); }
-                    else                 { sellPts += 15; r.Append("H1:Below50+15 "); }
-                }
-
-                // H1 MACD (EMA12 vs EMA26) — momentum direction
-                if (!double.IsNaN(h1e12) && !double.IsNaN(h1e26))
-                {
-                    if (h1e12 > h1e26) { buyPts  += 10; r.Append("H1:MACD++10 "); }
-                    else               { sellPts += 10; r.Append("H1:MACD-+10 "); }
-                }
-
-                // H1 price vs EMA200 — confirms we are in a real trend, not noise
-                if (!double.IsNaN(h1e200))
-                {
-                    if (h1Close > h1e200) { buyPts  += 10; r.Append("H1:Above200+10 "); }
-                    else                  { sellPts += 10; r.Append("H1:Below200+10 "); }
-                }
-            }
-
-            // ═══════════════════════════════════════════════════
-            // LAYER 3 — ENTRY TIMING (M15)    max ±35 points
-            // Answers: "Is this a good moment to enter?"
-            // ═══════════════════════════════════════════════════
-
-            // ADX trend strength + direction
-            double adx = _dms.ADX[idx];
-            double diP = _dms.DIPlus[idx];
-            double diM = _dms.DIMinus[idx];
-            if (!double.IsNaN(adx) && !double.IsNaN(diP) && !double.IsNaN(diM) && adx > 18.0)
-            {
-                if (diP > diM) { buyPts  += 15; r.Append("ADX:Bull+15 "); }
-                else           { sellPts += 15; r.Append("ADX:Bear+15 "); }
-            }
-
-            // RSI pullback — entering when price has pulled back, not extended
-            double rsi = CalcRSI(idx, 14);
-            if (!double.IsNaN(rsi))
-            {
-                if      (rsi < RsiBuyThreshold)  { buyPts  += 10; r.Append("RSI:Cheap+10 "); }
-                else if (rsi > RsiSellThreshold) { sellPts += 10; r.Append("RSI:Rich+10 "); }
-                // Partial credit: RSI between threshold and 50 = slight pullback
-                else if (rsi < 50) { buyPts  += 3; r.Append("RSI:Mild+3 "); }
-                else               { sellPts += 3; r.Append("RSI:Mild+3 "); }
-            }
-
-            // Price proximity to EMA21 — confirms we are buying a pullback, not a breakout
-            double ema21 = _ema21.Result[idx];
-            if (!double.IsNaN(ema21) && atr > 0)
-            {
-                double dist = Math.Abs(close - ema21) / atr;
-                if (dist < 1.5)
-                {
-                    if (close > ema21) { buyPts  += 5; r.Append("M15:NearEMA+5 "); }
-                    else               { sellPts += 5; r.Append("M15:NearEMA+5 "); }
-                }
-            }
-
-            // Volume: above-average volume = conviction
+            // ── Volume confirmation ────────────────────────────────────
             double vol    = Bars.TickVolumes[idx];
             double volSma = _volSma20.Result[idx];
-            if (!double.IsNaN(volSma) && volSma > 0 && vol > volSma * 1.1)
+            bool   volOk  = double.IsNaN(volSma) || volSma <= 0 || vol >= volSma * VolumeBreakoutMult;
+            if (!volOk) { reasoning = "Vol=" + (volSma > 0 ? (vol/volSma).ToString("F2") : "?") + "x < " + VolumeBreakoutMult.ToString("F1") + "x"; return 0; }
+
+            // ── H4 trend filter ────────────────────────────────────────
+            int    h4Idx = _h4Bars.Count - 2;
+            bool   h4Bull = true, h4Bear = true;
+            double h4e50 = double.NaN, h4e200 = double.NaN;
+            if (H4TrendFilter && h4Idx >= 0)
             {
-                bool bullBar = close > Bars.OpenPrices[idx];
-                if (bullBar) { buyPts  += 5; r.Append("Vol:Bull+5 "); }
-                else         { sellPts += 5; r.Append("Vol:Bear+5 "); }
+                h4e50  = _h4Ema50.Result[h4Idx];
+                h4e200 = _h4Ema200.Result[h4Idx];
+                if (!double.IsNaN(h4e50) && !double.IsNaN(h4e200))
+                {
+                    h4Bull = h4e50 > h4e200;
+                    h4Bear = h4e50 < h4e200;
+                }
             }
 
-            reasoning = r.ToString().TrimEnd();
+            // ── RSI confirmation ───────────────────────────────────────
+            double rsi      = CalcRSI(idx, 14);
+            bool   rsiOkBuy  = double.IsNaN(rsi) || rsi < RsiMaxBuy;
+            bool   rsiOkSell = double.IsNaN(rsi) || rsi > RsiMinSell;
 
-            // Net score: positive = bullish edge, negative = bearish edge
-            double netScore = buyPts - sellPts;  // range roughly -100 to +100
-            return netScore;
+            double volRatio = (!double.IsNaN(volSma) && volSma > 0) ? vol / volSma : 1.0;
+            double score    = 0;
+
+            if (bullBreak && (h4Bull || !H4TrendFilter) && rsiOkBuy)
+            {
+                // SL = entry price distance to just below Asian low (structural support)
+                slDistance = close - (_asianLow - atr * 0.3);
+                slDistance = Math.Max(slDistance, 10.0 * Symbol.PipSize);
+                slDistance = Math.Min(slDistance, 40.0 * Symbol.PipSize); // 40-pip hard cap
+
+                // Composite score 50-100 (each component is independently meaningful)
+                score  = 50;                                              // base: valid breakout
+                score += Math.Min(20.0, rangePips);                      // range quality (up to +20)
+                score += (volRatio >= 1.5 ? 15.0 : 5.0);                // volume conviction
+                score += (H4TrendFilter && h4Bull ? 15.0 : 0.0);        // H4 trend aligned
+                score += (!double.IsNaN(rsi) && rsi < 55.0 ? 10.0 : 0.0); // RSI not extended
+
+                reasoning = string.Format(
+                    "BUY Break={0:F5}>High={1:F5} Range={2:F1}p Vol={3:F1}x RSI={4:F0} H4={5}",
+                    close, _asianHigh, rangePips, volRatio,
+                    double.IsNaN(rsi) ? 0 : rsi,
+                    (!double.IsNaN(h4e50) && !double.IsNaN(h4e200)) ? (h4Bull ? "Bull" : "Bear") : "N/A");
+                return score;
+            }
+
+            if (bearBreak && (h4Bear || !H4TrendFilter) && rsiOkSell)
+            {
+                slDistance = (_asianHigh + atr * 0.3) - close;
+                slDistance = Math.Max(slDistance, 10.0 * Symbol.PipSize);
+                slDistance = Math.Min(slDistance, 40.0 * Symbol.PipSize);
+
+                score  = 50;
+                score += Math.Min(20.0, rangePips);
+                score += (volRatio >= 1.5 ? 15.0 : 5.0);
+                score += (H4TrendFilter && h4Bear ? 15.0 : 0.0);
+                score += (!double.IsNaN(rsi) && rsi > 45.0 ? 10.0 : 0.0);
+
+                reasoning = string.Format(
+                    "SELL Break={0:F5}<Low={1:F5} Range={2:F1}p Vol={3:F1}x RSI={4:F0} H4={5}",
+                    close, _asianLow, rangePips, volRatio,
+                    double.IsNaN(rsi) ? 0 : rsi,
+                    (!double.IsNaN(h4e50) && !double.IsNaN(h4e200)) ? (h4Bear ? "Bear" : "Bull") : "N/A");
+                return -score;
+            }
+
+            // Breakout direction filtered out (H4 or RSI rejected)
+            reasoning = string.Format("{0} break filtered: H4={1} RSI={2:F0}",
+                bullBreak ? "BUY" : "SELL",
+                (!double.IsNaN(h4e50) && !double.IsNaN(h4e200)) ? (h4e50 > h4e200 ? "Bull" : "Bear") : "N/A",
+                double.IsNaN(rsi) ? 0 : rsi);
+            return 0;
         }
         #endregion
 
@@ -720,39 +752,56 @@ namespace cAlgo.Robots
                 ActiveSignals = sigs, Direction = SignalDirection.None
             };
 
-            // Run the scored multi-layer analysis
+            // Run London Session Breakout evaluation
             string reasoning;
-            double netScore = EvaluateSetup(idx, out reasoning);
+            double slDist;
+            double netScore = EvaluateLondonBreakout(idx, out reasoning, out slDist);
 
             // Minimum score gate — adaptive threshold self-adjusts after each trade
-            if (Math.Abs(netScore) < _entryThreshold) return result;
+            if (Math.Abs(netScore) < _entryThreshold || slDist <= 0) return result;
 
-            SignalDirection dir = netScore > 0 ? SignalDirection.Long : SignalDirection.Short;
+            // Mark that we've entered today (one per London window)
+            _londonEntryDoneToday = true;
 
-            // Normalise score to [-1, +1] for compatibility with rest of system
-            double normScore = Math.Max(-1.0, Math.Min(1.0, netScore / 100.0));
-            double confidence = Math.Min(100.0, Math.Abs(netScore));
+            SignalDirection dir    = netScore > 0 ? SignalDirection.Long : SignalDirection.Short;
+            double          absScore = Math.Abs(netScore);
 
             result.Direction      = dir;
-            result.Score          = normScore;
-            result.Confidence     = confidence;
-            result.ConfluenceCount = (int)(Math.Abs(netScore) / 10);
-            result.StrengthLabel  = netScore > 80 ? "STRONG " + dir.ToString().ToUpper()
-                                  : netScore > 55 ? dir.ToString().ToUpper()
-                                  : "WEAK " + dir.ToString().ToUpper();
+            result.Score          = netScore / 100.0;
+            result.Confidence     = absScore;
+            result.ConfluenceCount = (int)(absScore / 15);
+            result.StrengthLabel  = absScore > 85 ? "STRONG " + dir.ToString().ToUpper()
+                                  : dir.ToString().ToUpper();
             result.ActiveSignals  = sigs;
+            result.SlDistance     = slDist;
+            result.Tp1Distance    = slDist * 1.0;
+            result.Tp2Distance    = slDist * 1.8;
+            result.Tp3Distance    = slDist * 3.0;
+            result.RiskReward     = 3.0;
+            result.TimeHorizon    = "4-12h";
+            result.Rationale      = string.Format("[Score={0:F0}/100 Thr={1:F0}] {2}",
+                                    absScore, _entryThreshold, reasoning);
+            result.EntryPrice     = dir == SignalDirection.Long ? Symbol.Ask : Symbol.Bid;
 
-            double atr    = _atr.Result[idx];
-            double slDist = ComputeSlDistance(dir, idx, atr);
-            result.SlDistance   = slDist;
-            result.Tp1Distance  = slDist * 1.0;
-            result.Tp2Distance  = slDist * 1.8;
-            result.Tp3Distance  = slDist * 3.0;
-            result.RiskReward   = 3.0;
-            result.TimeHorizon  = "2-8h";
-            result.Rationale    = string.Format("[Score={0:F0}/100 Thr={1:F0}] {2}",
-                                  Math.Abs(netScore), _entryThreshold, reasoning);
-            result.EntryPrice   = dir == SignalDirection.Long ? Symbol.Ask : Symbol.Bid;
+            // ── Store named signal features for AI weight learning ─────
+            double rangePips = (_asianHigh - _asianLow) / Symbol.PipSize;
+            double volSma    = _volSma20.Result[idx];
+            double vol       = Bars.TickVolumes[idx];
+            double volRatio  = (!double.IsNaN(volSma) && volSma > 0) ? vol / volSma : 1.0;
+            double rsi       = CalcRSI(idx, 14);
+            int h4Idx        = _h4Bars.Count - 2;
+            double h4e50     = h4Idx >= 0 ? _h4Ema50.Result[h4Idx]  : double.NaN;
+            double h4e200    = h4Idx >= 0 ? _h4Ema200.Result[h4Idx] : double.NaN;
+            int sign         = netScore > 0 ? 1 : -1;
+
+            sigs.Set("ASIAN_RANGE",  Math.Min(1.0, rangePips / Math.Max(1, AsianRangeMinPips) - 1.0));
+            sigs.Set("BREAKOUT_DIST", sign * 0.8);
+            sigs.Set("VOL_CONFIRM",  sign * Math.Min(1.0, volRatio / VolumeBreakoutMult - 0.1));
+            sigs.Set("H4_TREND",     (!double.IsNaN(h4e50) && !double.IsNaN(h4e200))
+                                     ? (sign * (h4e50 > h4e200 ? 0.9 : -0.5)) : 0.0);
+            sigs.Set("RSI_CONFIRM",  !double.IsNaN(rsi)
+                                     ? (netScore > 0 ? (rsi < 55 ? 0.7 : -0.4) : (rsi > 45 ? 0.7 : -0.4))
+                                     : 0.0);
 
             return result;
         }
@@ -1360,7 +1409,8 @@ namespace cAlgo.Robots
         private bool IsSessionOpen(DateTime utc)
         {
             double t = utc.Hour + utc.Minute / 60.0;
-            return (t >= 7.25 && t <= 11.75) || (t >= 13.25 && t <= 16.75);
+            // London open from 07:00, London/NY overlap 13:00–17:00
+            return (t >= 7.0 && t <= 11.75) || (t >= 13.0 && t <= 16.75);
         }
         private bool IsNewsBlackout(DateTime utc)
         {
