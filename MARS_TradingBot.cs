@@ -289,10 +289,14 @@ namespace cAlgo.Robots
         public int MaxConsecutiveLosses { get; set; }
         [Parameter("FTMO Phase (1 or 2)",    DefaultValue = 1,     MinValue = 1,    MaxValue = 2,    Group = "Risk")]
         public int Phase { get; set; }
-        [Parameter("Min Confidence %",       DefaultValue = 40.0,  MinValue = 25.0, MaxValue = 75.0, Group = "Signal")]
-        public double MinConfidence { get; set; }
-        [Parameter("Min Confluence Count",   DefaultValue = 4,     MinValue = 3,    MaxValue = 12,   Group = "Signal")]
-        public int MinConfluence { get; set; }
+        [Parameter("RSI Buy Threshold",      DefaultValue = 40,    MinValue = 25,   MaxValue = 50,   Group = "Signal")]
+        public int RsiBuyThreshold { get; set; }
+        [Parameter("RSI Sell Threshold",     DefaultValue = 60,    MinValue = 50,   MaxValue = 75,   Group = "Signal")]
+        public int RsiSellThreshold { get; set; }
+        [Parameter("BB Buy Zone (0-1)",      DefaultValue = 0.25,  MinValue = 0.1,  MaxValue = 0.45, Group = "Signal")]
+        public double BbBuyZone { get; set; }
+        [Parameter("BB Sell Zone (0-1)",     DefaultValue = 0.75,  MinValue = 0.55, MaxValue = 0.9,  Group = "Signal")]
+        public double BbSellZone { get; set; }
         [Parameter("Enable AI Learning",     DefaultValue = true,                                    Group = "Signal")]
         public bool EnableLearning { get; set; }
         [Parameter("ATR Period",             DefaultValue = 14,    MinValue = 5,    MaxValue = 30,   Group = "Indicators")]
@@ -588,25 +592,25 @@ namespace cAlgo.Robots
             }
 
             // ── 3. M15 RSI: oversold/overbought ───────────────────────
-            // +1 = RSI < 40 (oversold, buy pullback), -1 = RSI > 60 (overbought, sell rally)
+            // +1 = RSI < RsiBuyThreshold, -1 = RSI > RsiSellThreshold
             double rsi = CalcRSI(idx, 14);
             if (!double.IsNaN(rsi))
             {
-                if      (rsi < 40.0) s.Set("RSI_STATE",  1.0);
-                else if (rsi > 60.0) s.Set("RSI_STATE", -1.0);
-                else                 s.Set("RSI_STATE",  0.0);
+                if      (rsi < RsiBuyThreshold)  s.Set("RSI_STATE",  1.0);
+                else if (rsi > RsiSellThreshold) s.Set("RSI_STATE", -1.0);
+                else                             s.Set("RSI_STATE",  0.0);
             }
 
             // ── 4. BB STATE: price near band extreme ──────────────────
-            // +1 = near/below lower band (buy zone), -1 = near/above upper band (sell zone)
+            // +1 = pctB <= BbBuyZone, -1 = pctB >= BbSellZone
             double bbMid, bbTop, bbBot;
             CalcBB(idx, 20, 2.0, out bbMid, out bbTop, out bbBot);
             if (!double.IsNaN(bbTop) && (bbTop - bbBot) > 0)
             {
                 double pctB = (close - bbBot) / (bbTop - bbBot);
-                if      (pctB <= 0.25) s.Set("BB_STATE",  1.0);
-                else if (pctB >= 0.75) s.Set("BB_STATE", -1.0);
-                else                   s.Set("BB_STATE",  0.0);
+                if      (pctB <= BbBuyZone)  s.Set("BB_STATE",  1.0);
+                else if (pctB >= BbSellZone) s.Set("BB_STATE", -1.0);
+                else                         s.Set("BB_STATE",  0.0);
             }
 
             // ── 5. CANDLE: directional confirmation ───────────────────
