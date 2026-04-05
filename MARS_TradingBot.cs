@@ -277,7 +277,7 @@ namespace cAlgo.Robots
     public class MARSTradingBot : Robot
     {
         #region Parameters
-        [Parameter("Risk % Per Trade",       DefaultValue = 1.0,   MinValue = 0.25, MaxValue = 2.0,  Group = "Risk")]
+        [Parameter("Risk % Per Trade",       DefaultValue = 0.5,   MinValue = 0.25, MaxValue = 2.0,  Group = "Risk")]
         public double RiskPercentPerTrade { get; set; }
         [Parameter("Max Concurrent Trades",  DefaultValue = 2,     MinValue = 1,    MaxValue = 5,    Group = "Risk")]
         public int MaxConcurrentTrades { get; set; }
@@ -536,6 +536,17 @@ namespace cAlgo.Robots
                     if (signal.Direction == SignalDirection.Long  && h1Close < h1Ema50) return;
                     if (signal.Direction == SignalDirection.Short && h1Close > h1Ema50) return;
                 }
+            }
+
+            // Pullback filter — only enter near EMA21, not when price is extended
+            // Prevents chasing breakouts at the top/bottom of moves
+            double m15Close = Bars.ClosePrices[idx];
+            double m15Ema21 = _ema21.Result[idx];
+            double m15Atr   = _atr.Result[idx];
+            if (!double.IsNaN(m15Ema21) && m15Atr > 0)
+            {
+                double distFromEma = Math.Abs(m15Close - m15Ema21);
+                if (distFromEma > m15Atr * 1.5) return; // price too extended, wait for pullback
             }
 
             OpenTrade(signal, idx);
@@ -1106,8 +1117,9 @@ namespace cAlgo.Robots
                 slDist = Math.Max(entry - (swLow - atr * 0.3), atr * 0.8);
             else
                 slDist = Math.Max((swHigh + atr * 0.3) - entry, atr * 0.8);
-            double minStop = 10 * Symbol.PipSize; // EURUSD minimum
-            return Math.Max(slDist, minStop);
+            double minStop = 10 * Symbol.PipSize;
+            double maxStop = 20 * Symbol.PipSize; // hard cap: never risk more than 20 pips
+            return Math.Min(Math.Max(slDist, minStop), maxStop);
         }
 
         private string GetStrengthLabel(double score)
