@@ -277,11 +277,11 @@ namespace cAlgo.Robots
     public class MARSTradingBot : Robot
     {
         #region Parameters
-        [Parameter("Risk % Per Trade",       DefaultValue = 0.5,   MinValue = 0.25, MaxValue = 2.0,  Group = "Risk")]
+        [Parameter("Risk % Per Trade",       DefaultValue = 1.0,   MinValue = 0.25, MaxValue = 2.0,  Group = "Risk")]
         public double RiskPercentPerTrade { get; set; }
         [Parameter("Max Concurrent Trades",  DefaultValue = 2,     MinValue = 1,    MaxValue = 5,    Group = "Risk")]
         public int MaxConcurrentTrades { get; set; }
-        [Parameter("Max Trades Per Day",     DefaultValue = 4,     MinValue = 1,    MaxValue = 8,    Group = "Risk")]
+        [Parameter("Max Trades Per Day",     DefaultValue = 5,     MinValue = 1,    MaxValue = 8,    Group = "Risk")]
         public int MaxTradesPerDay { get; set; }
         [Parameter("Daily Loss Pause %",     DefaultValue = 1.0,   MinValue = 0,    MaxValue = 5.0,  Group = "Risk")]
         public double DailyLossPausePct { get; set; }
@@ -289,9 +289,9 @@ namespace cAlgo.Robots
         public int MaxConsecutiveLosses { get; set; }
         [Parameter("FTMO Phase (1 or 2)",    DefaultValue = 1,     MinValue = 1,    MaxValue = 2,    Group = "Risk")]
         public int Phase { get; set; }
-        [Parameter("Min Confidence %",       DefaultValue = 42.0,  MinValue = 25.0, MaxValue = 75.0, Group = "Signal")]
+        [Parameter("Min Confidence %",       DefaultValue = 40.0,  MinValue = 25.0, MaxValue = 75.0, Group = "Signal")]
         public double MinConfidence { get; set; }
-        [Parameter("Min Confluence Count",   DefaultValue = 5,     MinValue = 3,    MaxValue = 12,   Group = "Signal")]
+        [Parameter("Min Confluence Count",   DefaultValue = 4,     MinValue = 3,    MaxValue = 12,   Group = "Signal")]
         public int MinConfluence { get; set; }
         [Parameter("Enable AI Learning",     DefaultValue = true,                                    Group = "Signal")]
         public bool EnableLearning { get; set; }
@@ -546,7 +546,7 @@ namespace cAlgo.Robots
             if (!double.IsNaN(m15Ema21) && m15Atr > 0)
             {
                 double distFromEma = Math.Abs(m15Close - m15Ema21);
-                if (distFromEma > m15Atr * 1.5) return; // price too extended, wait for pullback
+                if (distFromEma > m15Atr * 2.5) return; // price too extended, wait for pullback
             }
 
             OpenTrade(signal, idx);
