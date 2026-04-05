@@ -504,51 +504,7 @@ namespace cAlgo.Robots
 
             if (signal.Direction == SignalDirection.None) return;
 
-            // H4 alignment gate for trend
-            int h4Idx = _h4Bars.Count - 2;
-            if (h4Idx >= 0)
-            {
-                double h4Fast = _h4Ema50.Result[h4Idx];
-                double h4Slow = _h4Ema200.Result[h4Idx];
-                if (!double.IsNaN(h4Fast) && !double.IsNaN(h4Slow) && h4Slow != 0)
-                {
-                    bool h4Bull = h4Fast > h4Slow;
-                    bool h4Bear = h4Fast < h4Slow;
-                    // Allow trade only if H4 is aligned or flat
-                    double sep = Math.Abs(h4Fast - h4Slow) / h4Slow * 100.0;
-                    if (sep > 0.05)
-                    {
-                        if (signal.Direction == SignalDirection.Long  && h4Bear) return;
-                        if (signal.Direction == SignalDirection.Short && h4Bull) return;
-                    }
-                }
-            }
-
-            // H1 real-time price confirmation — prevents buying into H1 downswings
-            // even when H4 EMA trend is still bullish (H4 is too slow/lagging)
-            int h1Idx = _h1Bars.Count - 2;
-            if (h1Idx >= 50)
-            {
-                double h1Close = _h1Bars.ClosePrices[h1Idx];
-                double h1Ema50 = _h1Ema50.Result[h1Idx];
-                if (!double.IsNaN(h1Ema50))
-                {
-                    if (signal.Direction == SignalDirection.Long  && h1Close < h1Ema50) return;
-                    if (signal.Direction == SignalDirection.Short && h1Close > h1Ema50) return;
-                }
-            }
-
-            // Pullback filter — only enter near EMA21, not when price is extended
-            // Prevents chasing breakouts at the top/bottom of moves
-            double m15Close = Bars.ClosePrices[idx];
-            double m15Ema21 = _ema21.Result[idx];
-            double m15Atr   = _atr.Result[idx];
-            if (!double.IsNaN(m15Ema21) && m15Atr > 0)
-            {
-                double distFromEma = Math.Abs(m15Close - m15Ema21);
-                if (distFromEma > m15Atr * 2.5) return; // price too extended, wait for pullback
-            }
-
+            // All 5 conditions already verified inside AggregateSignal — enter directly
             OpenTrade(signal, idx);
         }
 
@@ -601,7 +557,7 @@ namespace cAlgo.Robots
         }
         #endregion
 
-        #region All Indicator Calculations
+        #region Signal Calculations — 5-Condition High-Quality System
         private IndicatorSignals CalculateAllIndicators(int idx)
         {
             var s = new IndicatorSignals();
@@ -609,500 +565,120 @@ namespace cAlgo.Robots
             double close = Bars.ClosePrices[idx];
             if (atr <= 0 || double.IsNaN(atr)) return s;
 
-            CalcTrendSignals(s, idx, atr, close);
-            CalcMomentumSignals(s, idx, atr, close);
-            CalcVolatilitySignals(s, idx, atr, close);
-            CalcVolumeSignals(s, idx);
-            CalcOscillatorSignals(s, idx, close);
-            CalcSRSignals(s, idx, atr, close);
-            CalcPriceActionSignals(s, idx);
-            CalcTimeSignals(s);
-            CalcMultiTFSignals(s, idx, atr, close);
-            return s;
-        }
-
-        // ── I. TREND (16 signals) ─────────────────────────────────
-        private void CalcTrendSignals(IndicatorSignals s, int idx, double atr, double close)
-        {
-            // SMA signals
-            double sma20  = _sma20.Result[idx];
-            double sma50  = _sma50.Result[idx];
-            double sma100 = _sma100.Result[idx];
-            double sma200 = _sma200.Result[idx];
-            if (!double.IsNaN(sma20))  s.Set("SMA20",  (close - sma20)  / (atr * 3));
-            if (!double.IsNaN(sma50))  s.Set("SMA50",  (close - sma50)  / (atr * 5));
-            if (!double.IsNaN(sma100)) s.Set("SMA100", (close - sma100) / (atr * 8));
-            if (!double.IsNaN(sma200)) s.Set("SMA200", (close - sma200) / (atr * 12));
-
-            // EMA signals
-            double ema12 = _ema12.Result[idx];
-            double ema26 = _ema26.Result[idx];
-            double ema50 = _ema50.Result[idx];
-            double ema55 = _ema55.Result[idx];
-            double ema200 = _ema200.Result[idx];
-            if (!double.IsNaN(ema12))  s.Set("EMA12",  (close - ema12)  / (atr * 2));
-            if (!double.IsNaN(ema26))  s.Set("EMA26",  (close - ema26)  / (atr * 3));
-            if (!double.IsNaN(ema50))  s.Set("EMA50",  (close - ema50)  / (atr * 5));
-            if (!double.IsNaN(ema200)) s.Set("EMA200", (close - ema200) / (atr * 12));
-
-            // MACD histogram signal
-            double hist = _macd.Histogram[idx];
-            if (idx > 0)
-            {
-                double hist1 = _macd.Histogram[idx - 1];
-                if (!double.IsNaN(hist) && !double.IsNaN(hist1))
-                {
-                    s.Set("MACD",     hist / (atr * 0.5));
-                    // MACD momentum: direction of histogram change
-                    double macdMom = (hist - hist1) / (atr * 0.3);
-                    s.Set("MACD_MOM", macdMom);
-                    // MACD cross: +1 if hist>0 & rising, -1 if hist<0 & falling
-                    double cross = 0;
-                    if (hist > 0 && hist > hist1) cross = 1.0;
-                    else if (hist < 0 && hist < hist1) cross = -1.0;
-                    s.Set("MACD_CROSS", cross);
-                }
-            }
-
-            // ADX directional signal
-            double adx = _dms.ADX[idx];
-            if (!double.IsNaN(adx) && adx > 20)
-            {
-                double diPlus  = _dms.DIPlus[idx];
-                double diMinus = _dms.DIMinus[idx];
-                if (!double.IsNaN(diPlus) && !double.IsNaN(diMinus))
-                {
-                    double adxSig = diPlus > diMinus ? Math.Min(1.0, adx / 40.0)
-                                                     : -Math.Min(1.0, adx / 40.0);
-                    s.Set("ADX", adxSig);
-                }
-            }
-
-            // Parabolic SAR
-            double psar = _psar.Result[idx];
-            if (!double.IsNaN(psar)) s.Set("PSAR", close > psar ? 0.8 : -0.8);
-
-            // Linear Regression Slope (20-bar)
-            double slope = CalcLinRegSlope(idx, 20);
-            if (!double.IsNaN(slope)) s.Set("LINREG", slope / (atr * 1.5));
-
-            // HMA direction
-            double hma  = CalcHMA(idx, 20);
-            double hma3 = idx >= 3 ? CalcHMA(idx - 3, 20) : double.NaN;
-            if (!double.IsNaN(hma) && !double.IsNaN(hma3))
-                s.Set("HMA", (hma - hma3) / (atr * 2));
-
-            // Triple EMA alignment
-            double ema8 = _ema8.Result[idx];
-            double ema21 = _ema21.Result[idx];
-            if (!double.IsNaN(ema8) && !double.IsNaN(ema21) && !double.IsNaN(ema55))
-            {
-                double triSig = 0;
-                if (ema8 > ema21 && ema21 > ema55) triSig = 1.0;
-                else if (ema8 < ema21 && ema21 < ema55) triSig = -1.0;
-                s.Set("EMA_TRIPLE", triSig);
-            }
-
-            // Ichimoku cloud
-            s.Set("ICHIMOKU", CalcIchimokuSignal(idx));
-        }
-
-        // ── II. MOMENTUM (10 signals) ─────────────────────────────
-        private void CalcMomentumSignals(IndicatorSignals s, int idx, double atr, double close)
-        {
-            double rsi = CalcRSI(idx, 14);
-            if (!double.IsNaN(rsi)) s.Set("RSI", (rsi - 50.0) / 50.0);
-
-            double stochK = CalcStochK(idx, 14);
-            if (!double.IsNaN(stochK)) s.Set("STOCH", (stochK - 50.0) / 50.0);
-
-            // CCI(20)
-            double cci = CalcCCI(idx, 20);
-            if (!double.IsNaN(cci)) s.Set("CCI", cci / 200.0);
-
-            // ROC(12)
-            if (idx >= 12)
-            {
-                double roc = (close - Bars.ClosePrices[idx - 12]) / Bars.ClosePrices[idx - 12] * 100.0;
-                s.Set("ROC", roc / 1.5);
-            }
-
-            // Williams %R(14)
-            double willR = CalcWilliamsR(idx, 14);
-            if (!double.IsNaN(willR)) s.Set("WILLIAMS_R", (willR + 50.0) / 50.0);
-
-            // KDJ
-            double kdj = CalcKDJ(idx);
-            if (!double.IsNaN(kdj)) s.Set("KDJ", kdj / 50.0);
-
-            // Awesome Oscillator
-            double ao = CalcAO(idx);
-            if (!double.IsNaN(ao) && atr > 0) s.Set("AO", ao / (atr * 2.0));
-
-            // Ultimate Oscillator
-            double uo = CalcUO(idx);
-            if (!double.IsNaN(uo)) s.Set("UO", (uo - 50.0) / 50.0);
-
-            // Momentum(10)
-            if (idx >= 10)
-            {
-                double mom = close - Bars.ClosePrices[idx - 10];
-                s.Set("MOMENTUM", mom / (atr * 3.0));
-            }
-
-            // MACD momentum already in trend signals
-        }
-
-        // ── III. VOLATILITY (6 signals) ───────────────────────────
-        private void CalcVolatilitySignals(IndicatorSignals s, int idx, double atr, double close)
-        {
-            double bbMid, bbTop, bbBot;
-            CalcBB(idx, 20, 2.0, out bbMid, out bbTop, out bbBot);
-            if (!double.IsNaN(bbTop) && !double.IsNaN(bbBot) && (bbTop - bbBot) > 0)
-            {
-                double pctB = (close - bbBot) / (bbTop - bbBot) * 2.0 - 1.0;
-                s.Set("BB_PCTB", pctB);
-
-                double bbWidth = (bbTop - bbBot) / bbMid;
-                // Squeeze warning: tight bands = uncertainty
-                if (bbWidth < 0.0005) s.Set("BB_SQUEEZE", -0.3);
-            }
-
-            // ATR ratio (spike warning)
-            double atrSma = _atrSma50.Result[idx];
-            if (!double.IsNaN(atrSma) && atrSma > 0)
-            {
-                double ratio = atr / atrSma;
-                // High volatility = warn both sides (reduce confidence in signal)
-                if (ratio > 2.0) s.Set("ATR_SPIKE", -0.5);
-                else if (ratio < 0.5) s.Set("ATR_QUIET", 0.2); // low vol = ranging environment
-            }
-
-            // Keltner channels
-            double emaK = _ema21.Result[idx];
-            double atrK10 = CalcManualATR(Bars, idx, 10);
-            if (!double.IsNaN(emaK) && !double.IsNaN(atrK10) && atrK10 > 0)
-            {
-                double kelTop = emaK + 1.5 * atrK10;
-                double kelBot = emaK - 1.5 * atrK10;
-                if (kelTop != kelBot) s.Set("KELTNER", (close - kelBot) / (kelTop - kelBot) * 2.0 - 1.0);
-            }
-
-            // Donchian(20)
-            double donHigh = GetSwingHigh(idx, 20);
-            double donLow  = GetSwingLow(idx, 20);
-            if (donHigh > donLow) s.Set("DONCHIAN", (close - donLow) / (donHigh - donLow) * 2.0 - 1.0);
-
-            // NATR warning
-            double natr = close > 0 ? atr / close * 100.0 : 0;
-            if (natr > 0.15) s.Set("NATR_WARN", -0.4); // elevated vol warning
-        }
-
-        // ── IV. VOLUME (6 signals) ────────────────────────────────
-        private void CalcVolumeSignals(IndicatorSignals s, int idx)
-        {
-            double vol    = Bars.TickVolumes[idx];
-            double volSma = _volSma20.Result[idx];
-
-            // Volume vs average
-            if (!double.IsNaN(volSma) && volSma > 0)
-                s.Set("VOL_RATIO", (vol - volSma) / volSma);
-
-            // OBV slope
-            if (_obvHist.Count >= 6)
-            {
-                double obvNow  = _obvHist[_obvHist.Count - 1];
-                double obv5ago = _obvHist[Math.Max(0, _obvHist.Count - 6)];
-                double obvRange = Math.Abs(obvNow) + Math.Abs(obv5ago) + 1;
-                s.Set("OBV", (obvNow - obv5ago) / (obvRange * 0.5));
-            }
-
-            // MFI(14)
-            double mfi = CalcMFI(idx, 14);
-            if (!double.IsNaN(mfi)) s.Set("MFI", (mfi - 50.0) / 50.0);
-
-            // A/D Line slope
-            if (_adHist.Count >= 6)
-            {
-                double adNow  = _adHist[_adHist.Count - 1];
-                double ad5ago = _adHist[Math.Max(0, _adHist.Count - 6)];
-                double adRange = Math.Abs(adNow) + Math.Abs(ad5ago) + 1;
-                s.Set("AD_LINE", (adNow - ad5ago) / (adRange * 0.5));
-            }
-
-            // CMF(20)
-            double cmf = CalcCMF(idx, 20);
-            if (!double.IsNaN(cmf)) s.Set("CMF", cmf * 2.0); // CMF is ~-0.5 to 0.5
-
-            // Volume ROC(10)
-            if (idx >= 10)
-            {
-                double vol10ago = Bars.TickVolumes[idx - 10];
-                if (vol10ago > 0) s.Set("VOL_ROC", (vol - vol10ago) / vol10ago);
-            }
-        }
-
-        // ── V. OSCILLATORS (5 signals) ───────────────────────────
-        private void CalcOscillatorSignals(IndicatorSignals s, int idx, double close)
-        {
-            // PPO
-            double ema12 = _ema12.Result[idx];
-            double ema26 = _ema26.Result[idx];
-            if (!double.IsNaN(ema12) && !double.IsNaN(ema26) && ema26 != 0)
-                s.Set("PPO", (ema12 - ema26) / ema26 * 100.0 / 0.5);
-
-            // DeMarker(14)
-            double dem = CalcDeMarker(idx, 14);
-            if (!double.IsNaN(dem)) s.Set("DEMARKER", (dem - 0.5) * 2.0);
-
-            // Stochastic RSI
-            double srsi = CalcStochRSI(14);
-            if (!double.IsNaN(srsi)) s.Set("STOCH_RSI", (srsi - 50.0) / 50.0);
-
-            // Price Position(20)
-            double hi20 = GetSwingHigh(idx, 20);
-            double lo20 = GetSwingLow(idx, 20);
-            if (hi20 > lo20) s.Set("PRICE_POS", (close - lo20) / (hi20 - lo20) * 2.0 - 1.0);
-
-            // Fisher Transform(10)
-            double fisher = CalcFisher(idx, 10);
-            if (!double.IsNaN(fisher)) s.Set("FISHER", fisher / 2.0);
-        }
-
-        // ── VI. SUPPORT & RESISTANCE (5 signals) ─────────────────
-        private void CalcSRSignals(IndicatorSignals s, int idx, double atr, double close)
-        {
-            // VWAP
-            if (_vwapDen > 0)
-                s.Set("VWAP", (close - _vwap) / (atr * 2.0));
-
-            // Pivot points
-            if (_pdHigh > 0 && _pdLow > 0 && _pdClose > 0)
-            {
-                double pp = (_pdHigh + _pdLow + _pdClose) / 3.0;
-                double r1 = 2 * pp - _pdLow;
-                double s1 = 2 * pp - _pdHigh;
-                double pivSig = 0;
-                if      (close > r1)             pivSig =  1.0;
-                else if (close > pp)             pivSig =  0.5;
-                else if (close < s1)             pivSig = -1.0;
-                else if (close < pp)             pivSig = -0.5;
-                s.Set("PIVOT", pivSig);
-            }
-
-            // Previous day high/low
-            if (_pdHigh > 0 && _pdLow > 0)
-            {
-                if      (close > _pdHigh) s.Set("PREV_DAY_HL",  0.8);
-                else if (close < _pdLow)  s.Set("PREV_DAY_HL", -0.8);
-                else                      s.Set("PREV_DAY_HL",  (close - _pdLow) / (_pdHigh - _pdLow) * 2.0 - 1.0);
-            }
-
-            // Fibonacci
-            s.Set("FIB", CalcFibSignal(idx, 50, atr, close));
-
-            // Donchian position (also in volatility, but as S/R here)
-            double dHigh = GetSwingHigh(idx, 50);
-            double dLow  = GetSwingLow(idx, 50);
-            if (dHigh > dLow)
-            {
-                double range50 = dHigh - dLow;
-                // Near top of 50-bar range = resistance (negative for longs)
-                double pos50 = (close - dLow) / range50 * 2.0 - 1.0;
-                // Fade extremes: at top of range → -0.5 (bearish), at bottom → +0.5 (bullish MR)
-                // For trend: if above midrange and pushing higher → positive
-                s.Set("RANGE50", pos50 * 0.5);
-            }
-        }
-
-        // ── VII. PRICE ACTION (5 signals) ─────────────────────────
-        private void CalcPriceActionSignals(IndicatorSignals s, int idx)
-        {
-            if (idx < 2) return;
-
-            // Candlestick patterns
-            double candleSig = 0;
-            if (IsBullishEngulfing(idx) || IsHammer(idx) || IsBullishPinBar(idx)) candleSig =  1.0;
-            if (IsBearishEngulfing(idx) || IsShootingStar(idx) || IsBearishPinBar(idx)) candleSig = -1.0;
-            s.Set("CANDLE", candleSig);
-
-            // Break of Structure (higher high or lower low vs 10 bars ago)
-            if (idx >= 10)
-            {
-                double hi10 = GetSwingHigh(idx - 1, 10);
-                double lo10 = GetSwingLow(idx - 1, 10);
-                double close = Bars.ClosePrices[idx];
-                if      (close > hi10) s.Set("BOS",  0.8);
-                else if (close < lo10) s.Set("BOS", -0.8);
-            }
-
-            // RSI Divergence (price vs RSI direction over 5 bars)
-            if (idx >= 5)
-            {
-                double closeNow  = Bars.ClosePrices[idx];
-                double close5    = Bars.ClosePrices[idx - 5];
-                double rsiNow    = CalcRSI(idx, 14);
-                double rsi5      = CalcRSI(idx - 5, 14);
-                if (!double.IsNaN(rsiNow) && !double.IsNaN(rsi5))
-                {
-                    bool bullDiv = closeNow < close5 && rsiNow > rsi5; // price fell, RSI rose
-                    bool bearDiv = closeNow > close5 && rsiNow < rsi5; // price rose, RSI fell
-                    if (bullDiv) s.Set("RSI_DIV",  0.8);
-                    if (bearDiv) s.Set("RSI_DIV", -0.8);
-                }
-            }
-
-            // MACD Divergence
-            if (idx >= 5)
-            {
-                double closeNow  = Bars.ClosePrices[idx];
-                double close5    = Bars.ClosePrices[idx - 5];
-                double histNow   = _macd.Histogram[idx];
-                double hist5     = _macd.Histogram[idx - 5];
-                if (!double.IsNaN(histNow) && !double.IsNaN(hist5))
-                {
-                    bool bullDiv = closeNow < close5 && histNow > hist5;
-                    bool bearDiv = closeNow > close5 && histNow < hist5;
-                    if (bullDiv) s.Set("MACD_DIV",  0.7);
-                    if (bearDiv) s.Set("MACD_DIV", -0.7);
-                }
-            }
-
-            // Pullback zone (price between EMA21 and EMA55 in aligned trend)
-            double ema21v = _ema21.Result[idx];
-            double ema55v = _ema55.Result[idx];
-            double ema8v  = _ema8.Result[idx];
-            if (!double.IsNaN(ema8v) && !double.IsNaN(ema21v) && !double.IsNaN(ema55v))
-            {
-                double closeP = Bars.ClosePrices[idx];
-                if (ema8v > ema21v && ema21v > ema55v) // bull aligned
-                {
-                    if (closeP >= ema55v && closeP <= ema21v + (ema21v - ema55v) * 0.5)
-                        s.Set("PULLBACK", 0.7); // in pullback zone
-                }
-                else if (ema8v < ema21v && ema21v < ema55v) // bear aligned
-                {
-                    if (closeP <= ema55v && closeP >= ema21v - (ema55v - ema21v) * 0.5)
-                        s.Set("PULLBACK", -0.7);
-                }
-            }
-        }
-
-        // ── VIII. TIME-BASED (2 signals) ──────────────────────────
-        private void CalcTimeSignals(IndicatorSignals s)
-        {
-            double hhmm = Server.Time.Hour + Server.Time.Minute / 60.0;
-            // London 07:15-11:45 + NY 13:15-16:45 = active sessions → positive
-            bool london = hhmm >= 7.25 && hhmm <= 11.75;
-            bool ny     = hhmm >= 13.25 && hhmm <= 16.75;
-            bool dead   = hhmm < 2.0 || (hhmm > 22.0);
-            double sess = london || ny ? 0.25 : dead ? -0.3 : 0;
-            s.Set("SESSION", sess);
-
-            // Day of week
-            var dow = Server.Time.DayOfWeek;
-            double dowSig = 0;
-            if (dow == DayOfWeek.Tuesday || dow == DayOfWeek.Wednesday || dow == DayOfWeek.Thursday) dowSig = 0.1;
-            if (dow == DayOfWeek.Friday && hhmm > 15.0) dowSig = -0.3; // Friday afternoon
-            s.Set("DOW", dowSig);
-        }
-
-        // ── IX. MULTI-TF (5 signals) ──────────────────────────────
-        private void CalcMultiTFSignals(IndicatorSignals s, int idx, double atr, double close)
-        {
-            // H1 trend
-            int h1Idx = _h1Bars.Count - 2;
-            if (h1Idx >= 0)
-            {
-                double h1Ema50  = _h1Ema50.Result[h1Idx];
-                double h1Ema200 = _h1Ema200.Result[h1Idx];
-                double h1Close  = _h1Bars.ClosePrices[h1Idx];
-                double h1Atr    = CalcManualATR(_h1Bars, h1Idx, 14);
-                if (!double.IsNaN(h1Ema50) && !double.IsNaN(h1Atr) && h1Atr > 0)
-                    s.Set("H1_TREND", (h1Close - h1Ema50) / (h1Atr * 5.0));
-
-                // H1 MACD
-                double h1e12 = _h1Ema12.Result[h1Idx];
-                double h1e26 = _h1Ema26.Result[h1Idx];
-                if (!double.IsNaN(h1e12) && !double.IsNaN(h1e26) && !double.IsNaN(h1Atr) && h1Atr > 0)
-                    s.Set("H1_MACD", (h1e12 - h1e26) / (h1Atr * 1.5));
-
-                // H1 RSI (manual)
-                double h1Rsi = CalcRSIForBars(_h1Bars, h1Idx, 14);
-                if (!double.IsNaN(h1Rsi)) s.Set("H1_RSI", (h1Rsi - 50.0) / 50.0);
-            }
-
-            // H4 trend
+            // ── 1. H4 TREND: EMA50 vs EMA200 ─────────────────────────
+            // +1 = H4 bullish, -1 = H4 bearish
             int h4Idx = _h4Bars.Count - 2;
             if (h4Idx >= 0)
             {
                 double h4e50  = _h4Ema50.Result[h4Idx];
                 double h4e200 = _h4Ema200.Result[h4Idx];
-                if (!double.IsNaN(h4e50) && !double.IsNaN(h4e200) && h4e200 != 0)
-                {
-                    double h4Trend = (h4e50 - h4e200) / (h4e200 * 0.002); // 0.2% = full signal
-                    s.Set("H4_TREND", h4Trend);
-                }
+                if (!double.IsNaN(h4e50) && !double.IsNaN(h4e200))
+                    s.Set("H4_TREND", h4e50 > h4e200 ? 1.0 : -1.0);
             }
 
-            // MTF alignment (all 3 must agree)
-            double m15sig = 0, h1sig = 0, h4sig = 0;
-            if (s.ContainsKey("EMA_TRIPLE")) m15sig = s["EMA_TRIPLE"];
-            if (s.ContainsKey("H1_TREND"))   h1sig  = Math.Sign(s["H1_TREND"]);
-            if (s.ContainsKey("H4_TREND"))   h4sig  = Math.Sign(s["H4_TREND"]);
-            double mtfAlign = 0;
-            if (m15sig > 0 && h1sig >= 0 && h4sig >= 0) mtfAlign =  (m15sig + (h1sig > 0 ? 0.5 : 0) + (h4sig > 0 ? 0.5 : 0)) / 2.0;
-            if (m15sig < 0 && h1sig <= 0 && h4sig <= 0) mtfAlign = -(Math.Abs(m15sig) + (h1sig < 0 ? 0.5 : 0) + (h4sig < 0 ? 0.5 : 0)) / 2.0;
-            s.Set("MTF_ALIGN", mtfAlign);
+            // ── 2. H1 TREND: close vs H1 EMA50 ────────────────────────
+            // +1 = H1 bullish (price above EMA50), -1 = bearish
+            int h1Idx = _h1Bars.Count - 2;
+            if (h1Idx >= 50)
+            {
+                double h1Close = _h1Bars.ClosePrices[h1Idx];
+                double h1e50   = _h1Ema50.Result[h1Idx];
+                if (!double.IsNaN(h1e50))
+                    s.Set("H1_TREND", h1Close > h1e50 ? 1.0 : -1.0);
+            }
+
+            // ── 3. M15 RSI: oversold/overbought ───────────────────────
+            // +1 = RSI < 40 (oversold, buy pullback), -1 = RSI > 60 (overbought, sell rally)
+            double rsi = CalcRSI(idx, 14);
+            if (!double.IsNaN(rsi))
+            {
+                if      (rsi < 40.0) s.Set("RSI_STATE",  1.0);
+                else if (rsi > 60.0) s.Set("RSI_STATE", -1.0);
+                else                 s.Set("RSI_STATE",  0.0);
+            }
+
+            // ── 4. BB STATE: price near band extreme ──────────────────
+            // +1 = near/below lower band (buy zone), -1 = near/above upper band (sell zone)
+            double bbMid, bbTop, bbBot;
+            CalcBB(idx, 20, 2.0, out bbMid, out bbTop, out bbBot);
+            if (!double.IsNaN(bbTop) && (bbTop - bbBot) > 0)
+            {
+                double pctB = (close - bbBot) / (bbTop - bbBot);
+                if      (pctB <= 0.25) s.Set("BB_STATE",  1.0);
+                else if (pctB >= 0.75) s.Set("BB_STATE", -1.0);
+                else                   s.Set("BB_STATE",  0.0);
+            }
+
+            // ── 5. CANDLE: directional confirmation ───────────────────
+            // +1 = bullish candle pattern, -1 = bearish candle pattern
+            if (idx >= 2)
+            {
+                bool bullCandle = IsBullishEngulfing(idx) || IsHammer(idx) || IsBullishPinBar(idx)
+                    || (Bars.ClosePrices[idx] > Bars.OpenPrices[idx]
+                        && Bars.ClosePrices[idx] > Bars.ClosePrices[idx - 1]);
+                bool bearCandle = IsBearishEngulfing(idx) || IsShootingStar(idx) || IsBearishPinBar(idx)
+                    || (Bars.ClosePrices[idx] < Bars.OpenPrices[idx]
+                        && Bars.ClosePrices[idx] < Bars.ClosePrices[idx - 1]);
+                if      (bullCandle && !bearCandle) s.Set("CANDLE",  1.0);
+                else if (bearCandle && !bullCandle) s.Set("CANDLE", -1.0);
+                else                               s.Set("CANDLE",  0.0);
+            }
+
+            return s;
         }
         #endregion
+
 
         #region Signal Aggregation & Trade Decision
         private TradingSignal AggregateSignal(IndicatorSignals sigs, int idx)
         {
-            double score      = _ai.Score(sigs);
-            double confidence = _ai.Confidence(sigs, score);
-            int    active     = sigs.CountActive(0.15);
-            int    agreeing   = sigs.CountAgreeing(score, 0.15);
-
             var result = new TradingSignal
             {
-                Score           = score,
-                Confidence      = confidence,
-                ConfluenceCount = agreeing,
-                ActiveSignals   = sigs,
-                Direction       = SignalDirection.None
+                Score = 0, Confidence = 0, ConfluenceCount = 0,
+                ActiveSignals = sigs, Direction = SignalDirection.None
             };
 
-            // MTF alignment veto: if MTF_ALIGN opposes score, reduce confidence
-            if (sigs.ContainsKey("MTF_ALIGN"))
-            {
-                double mtf = sigs["MTF_ALIGN"];
-                if (Math.Sign(mtf) != Math.Sign(score) && Math.Abs(mtf) > 0.3)
-                    confidence *= 0.6; // penalise counter-trend signals hard
-            }
-            result.Confidence = confidence;
+            // All 5 conditions must be present and agree — AND gate, not average
+            if (!sigs.ContainsKey("H4_TREND") || !sigs.ContainsKey("H1_TREND")  ||
+                !sigs.ContainsKey("RSI_STATE") || !sigs.ContainsKey("BB_STATE")  ||
+                !sigs.ContainsKey("CANDLE"))
+                return result;
 
-            // Entry thresholds
-            if (confidence < MinConfidence) return result;
-            if (agreeing < MinConfluence)   return result;
-            if (Math.Abs(score) < 0.22)     return result;
+            double h4  = sigs["H4_TREND"];
+            double h1  = sigs["H1_TREND"];
+            double rsi = sigs["RSI_STATE"];
+            double bb  = sigs["BB_STATE"];
+            double ca  = sigs["CANDLE"];
 
-            SignalDirection dir = score > 0 ? SignalDirection.Long : SignalDirection.Short;
-            result.Direction = dir;
+            // BUY: every condition must be positive
+            bool buySetup  = h4 > 0 && h1 > 0 && rsi > 0 && bb > 0 && ca > 0;
+            // SELL: every condition must be negative
+            bool sellSetup = h4 < 0 && h1 < 0 && rsi < 0 && bb < 0 && ca < 0;
 
-            // Compute SL distances using swing structure
-            double atr = _atr.Result[idx];
+            if (!buySetup && !sellSetup) return result;
+
+            SignalDirection dir = buySetup ? SignalDirection.Long : SignalDirection.Short;
+            result.Direction      = dir;
+            result.Score          = buySetup ? 1.0 : -1.0;
+            result.Confidence     = 100.0; // all 5 agreed
+            result.ConfluenceCount = 5;
+            result.StrengthLabel  = buySetup ? "BUY" : "SELL";
+
+            // Also run AI scoring for learning — weight update still improves over time
+            double aiScore = _ai.Score(sigs);
+            result.Score = aiScore != 0 ? aiScore : result.Score;
+
+            double atr    = _atr.Result[idx];
             double slDist = ComputeSlDistance(dir, idx, atr);
             result.SlDistance   = slDist;
             result.Tp1Distance  = slDist * 1.0;
             result.Tp2Distance  = slDist * 1.8;
             result.Tp3Distance  = slDist * 3.0;
             result.RiskReward   = 3.0;
-            result.TimeHorizon  = "3-10h";
-            result.StrengthLabel = GetStrengthLabel(score);
-            result.Rationale     = sigs.TopSignals(6, 0.15);
-            result.EntryPrice    = dir == SignalDirection.Long ? Symbol.Ask : Symbol.Bid;
+            result.TimeHorizon  = "2-8h";
+            result.Rationale    = string.Format("H4={0:F0} H1={1:F0} RSI={2:F0} BB={3:F0} CA={4:F0}",
+                                  h4, h1, rsi, bb, ca);
+            result.EntryPrice   = dir == SignalDirection.Long ? Symbol.Ask : Symbol.Bid;
 
             return result;
         }
